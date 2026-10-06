@@ -653,6 +653,12 @@ With FSDP2, an unspecified batch size defaults to 1 instead of probing memory in
 on each rank. Recipe `score_size` is a global sample budget, divided by the world size and
 per-rank batch size, with at least one scoring batch per rank.
 
+Qwen checkpoints with `model_type` `qwen3_5` or `qwen3_5_moe` support this path for
+**text-only calibration**. The loader retains the conditional-generation architecture and
+vision tower, but `--calib_with_images` remains unsupported with FSDP2. During mixed-format
+export, linear-attention QKV/Z and B/A projections retain their separate runtime-fusion
+groups. Weight AutoQuantize with FSDP2 remains experimental.
+
 #### KV-cache AutoQuantize
 
 The same launch supports `general/auto_quantize/kv_fp8_nvfp4_cast_kl_div_at_5p4bits`
