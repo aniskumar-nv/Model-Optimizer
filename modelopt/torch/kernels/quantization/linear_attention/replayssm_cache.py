@@ -34,7 +34,7 @@ def _gdn_replay_state_spec(key_heads, value_heads, value_dim, *, read_mode="tp8_
     extra = ()
     if read_mode == "tp4_hi32":
         tiles = triton.next_power_of_2(triton.cdiv(value_dim, 64))
-        # Request-wide NVFP4 amax scratch, padded to preserve 16-byte page alignment.
+        # NVFP4 amax scratch per head/tile, padded to preserve 16-byte page alignment.
         extra = (((triton.cdiv(value_heads * tiles, 4) * 4,), torch.float32),)
     return (
         ((value_heads, value_dim, 128), torch.float32),  # recurrence checkpoint
@@ -109,7 +109,7 @@ class _GDNReplayCache:
             )
             self.read_seeds.index_copy_(0, indices.long(), seeds)
         if self.read_mode == "tp4_hi32":
-            # Unused row tiles participate in the request-wide reduction and must be zero.
+            # Unused row tiles participate in each head's reduction and must be zero.
             self.amax.index_fill_(0, indices.long(), 0)
 
     @torch.no_grad()
@@ -121,7 +121,6 @@ class _GDNReplayCache:
         """
         # Optional standalone ReplaySSM dependency, pinned by the example.
         from emulation.gdn_replay_unf_vf import _gdn_unf_vf_step_kernel
-        from emulation.mamba2_replay import _flush_quant_kernel
         from emulation.modes import MODES
 
         rows, heads, values = output.shape
@@ -196,42 +195,17 @@ class _GDNReplayCache:
             precision.read if precision.two_precision else precision.state,
             precision.nvfp4,
         )
-        if self.read_rounding == "stochastic":
+        if precision.nvfp4:
             from .replayssm_read import refresh_nvfp4_read
 
             refresh_nvfp4_read(
                 self.anchor,
                 self.read,
                 self.amax,
-                self.read_seeds,
                 positions,
                 windows,
                 indices,
+                seeds=self.read_seeds if self.read_rounding == "stochastic" else None,
                 null=0,
-            )
-        elif precision.nvfp4:
-            # Upstream's second pass shares one global scale across each request's heads/tiles.
-            _flush_quant_kernel[grid](
-                self.anchor,
-                self.read,
-                self.amax,
-                positions,
-                flush,
-                windows,
-                indices,
-                0,
-                1234,
-                self.anchor.stride(0),
-                self.amax.stride(0),
-                rows,
-                heads,
-                values,
-                128,
-                64,
-                tiles,
-                precision.two_precision,
-                precision.state,
-                precision.stochastic,
-                precision.read,
             )
         self.steps.index_add_(0, indices, (indices != 0).to(torch.int32))

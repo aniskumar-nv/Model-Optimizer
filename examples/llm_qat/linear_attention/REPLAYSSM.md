@@ -72,10 +72,10 @@ The recipe sets `precision="replayssm_two_precision"`, `replay_window=16`, and:
 | --- | --- | --- |
 | `gdn_state_quantizer` | Disabled: recurrence stays FP32 | `[H,V,K]` internally |
 | `gdn_read_quantizer` (FP8 recipe) | Dynamic E4M3, `block_sizes={-1: 128}`, identity STE | One scale per 128 key channels of each value row |
-| `gdn_read_quantizer` (NVFP4 recipe) | Dynamic E2M1, block16 E4M3 scales, identity STE | Groups of 16 key channels; one FP32 global scale per request |
+| `gdn_read_quantizer` (NVFP4 recipe) | Dynamic E2M1, block16 E4M3 scales, identity STE | Groups of 16 key channels; one FP32 global scale per request and head at each refresh |
 
 NVFP4 uses the existing TensorQuantizer configuration and upstream replay codec.
-A second kernel reduces the request-wide amax and refreshes the read
+A second kernel reduces each head's state amax independently and refreshes the read
 copy at initialization and each 16-token flush. Training and the vLLM cache
 adapter use the same mode. The FP32 recurrence anchor never uses the quantized read copy.
 
@@ -248,7 +248,7 @@ this initial engine integration. Keep ordinary state-QDQ serving separate.
 
 ## Validation and remaining work
 
-NVFP4 qualification on JHB GB300 passed all six indexed-cache cases
+Before the per-head outer-scale change, NVFP4 qualification on JHB GB300 passed all six indexed-cache cases
 (FP8/NVFP4/FP32 reads, eager/captured execution) and the NVFP4 full-decode-graph
 engine case. Cache outputs, anchors and read copies were bit-exact against
 upstream through flushes and slot reuse, including a partial value tile. The

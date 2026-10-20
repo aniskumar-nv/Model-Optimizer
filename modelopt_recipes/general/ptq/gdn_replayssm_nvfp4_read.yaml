@@ -21,7 +21,7 @@ imports:
 metadata:
   description: >-
     GDN ReplaySSM with an FP32 recurrence anchor and an NVFP4 block16 read copy.
-    Uses E4M3 block scales and one global scale per request.
+    Uses E4M3 block scales and one global scale per request and head at each refresh.
     Requires upstream ReplaySSM emulation and a fixed 16-token decode window.
     This is floating-storage QAT emulation; the vLLM engine adapter is separate.
 quantize:

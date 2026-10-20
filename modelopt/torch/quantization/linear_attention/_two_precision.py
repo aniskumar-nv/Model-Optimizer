@@ -46,31 +46,31 @@ def _native_replay(state, read_mode, read_rounding="nearest", *, key_heads=None)
     # Optional standalone backend; installing public vLLM does not install this package.
     from emulation import GDNReplay
 
+    if read_rounding not in ("nearest", "stochastic"):
+        raise ValueError(f"Unsupported read rounding: {read_rounding}")
+    if read_rounding == "stochastic" and read_mode != "tp4_hi32":
+        raise ValueError("Stochastic ReplaySSM reads require NVFP4 with an FP32 anchor")
     runner_type = GDNReplay
-    if read_rounding == "stochastic":
-        if read_mode != "tp4_hi32":
-            raise ValueError("Stochastic ReplaySSM reads require NVFP4 with an FP32 anchor")
+    if read_mode == "tp4_hi32":
         from modelopt.torch.kernels.quantization.linear_attention.replayssm_read import (
             refresh_nvfp4_read,
         )
 
-        class StochasticReadReplay(GDNReplay):
+        class NVFP4ReadReplay(GDNReplay):
             def _finish_step(self, grid):
                 refresh_nvfp4_read(
                     self.state_hi,
                     self.state_lo,
                     self.amax,
-                    self.read_seeds,
                     self.write_pos,
                     self.window_idx,
                     self.state_idx,
+                    seeds=self.read_seeds if read_rounding == "stochastic" else None,
                 )
                 self.steps.add_(1)
                 return self.output
 
-        runner_type = StochasticReadReplay
-    elif read_rounding != "nearest":
-        raise ValueError(f"Unsupported read rounding: {read_rounding}")
+        runner_type = NVFP4ReadReplay
     runner = runner_type(
         state.transpose(-1, -2).unsqueeze(0).contiguous(),
         state.shape[0] if key_heads is None else key_heads,

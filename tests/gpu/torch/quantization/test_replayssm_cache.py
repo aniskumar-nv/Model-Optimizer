@@ -24,6 +24,7 @@ from modelopt.torch.kernels.quantization.linear_attention.replayssm_cache import
     _gdn_replay_state_spec,
     _GDNReplayCache,
 )
+from modelopt.torch.quantization.linear_attention._two_precision import _native_replay
 
 native = pytest.importorskip("emulation", reason="Requires pinned upstream ReplaySSM emulation")
 
@@ -64,13 +65,12 @@ def test_replay_cache_reordering_flush_and_reuse(read_mode, rounding, captured):
         state = torch.randn(1, 2, 144, 128, device="cuda") * 0.1
         buffers[0][slot].copy_(state[0])
         cache.reset(torch.tensor([slot], device="cuda", dtype=torch.int32))
-        if rounding == "stochastic":
-            from modelopt.torch.quantization.linear_attention._two_precision import _native_replay
-
+        if read_mode == "tp4_hi32":
             references[slot] = _native_replay(
                 state[0].transpose(-1, -2), read_mode, rounding, key_heads=1
             )
-            references[slot].read_seeds.copy_(cache.read_seeds[slot : slot + 1])
+            if rounding == "stochastic":
+                references[slot].read_seeds.copy_(cache.read_seeds[slot : slot + 1])
         else:
             references[slot] = native.GDNReplay(state, 1, read_mode)
 
@@ -143,22 +143,39 @@ def test_replay_cache_reordering_flush_and_reuse(read_mode, rounding, captured):
     assert torch.all(cache.steps[[0, 4]] == -1)
 
 
-def test_stochastic_read_grid():
+@pytest.mark.parametrize("stochastic", [False, True])
+def test_nvfp4_read_grid_and_head_isolation(stochastic):
     from modelopt.torch.kernels.quantization.linear_attention.replayssm_read import (
         refresh_nvfp4_read,
     )
 
-    anchor = torch.full((1, 1, 128, 128), 1.125, device="cuda")
+    anchor = torch.full((2, 2, 128, 128), 1.125, device="cuda")
     anchor[..., 1::2] = -1.125
     anchor[..., 15::16] = 6  # Exact global and E4M3 scales; adjacent codes are +/-1 and +/-1.5.
     read = torch.empty_like(anchor)
-    amax = torch.full((1, 1, 2), 6.0, device="cuda")
-    seed = torch.tensor([17], device="cuda", dtype=torch.int32)
-    zero = torch.zeros_like(seed)
-    refresh_nvfp4_read(anchor, read, amax, seed, zero, zero, zero)
+    seed = torch.tensor([17, 19], device="cuda", dtype=torch.int32) if stochastic else None
+    indices = torch.arange(2, device="cuda", dtype=torch.int32)
+    zero = torch.zeros_like(indices)
+
+    def refresh():
+        amax = anchor.reshape(2, 2, 2, 64, 128).abs().amax((-1, -2))
+        refresh_nvfp4_read(anchor, read, amax, zero, zero, indices, seeds=seed)
+
+    refresh()
     actual = read[..., :15].reshape(-1)
     expected = anchor[..., :15].reshape(-1)
     assert ((actual.abs() == 1) | (actual.abs() == 1.5)).all()
-    assert (actual[expected > 0].mean() - 1.125).abs() < 0.02
-    assert (actual[expected < 0].mean() + 1.125).abs() < 0.02
+    if stochastic:
+        assert (actual[expected > 0].mean() - 1.125).abs() < 0.02
+        assert (actual[expected < 0].mean() + 1.125).abs() < 0.02
+    else:
+        torch.testing.assert_close(actual, expected.sign(), rtol=0, atol=0)
     assert torch.all(read[..., 15::16] == 6)
+    independent = read[0, 0].clone()
+    # Other heads and requests must not change this head's outer scale or rounding.
+    anchor[0, 1].mul_(2**20)
+    anchor[1].mul_(2**22)
+    before = anchor.clone()
+    refresh()
+    torch.testing.assert_close(read[0, 0], independent, rtol=0, atol=0)
+    torch.testing.assert_close(anchor, before, rtol=0, atol=0)

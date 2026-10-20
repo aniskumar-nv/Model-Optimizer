@@ -51,7 +51,10 @@ def _oracle(q, k, v, g, beta, state, quantizer, reads=None):
         return forward_value(x, x.to(dtype))
 
     def read_copy(x):
-        rounded = quantizer(x.detach().transpose(-1, -2).contiguous()).transpose(-1, -2)
+        # Each head has its own NVFP4 outer scale, independent of the replay kernel.
+        value_first = x.detach().transpose(-1, -2)
+        rounded = torch.stack([quantizer(head.contiguous()) for head in value_first])
+        rounded = rounded.transpose(-1, -2)
         return forward_value(x, rounded)
 
     q = q / (q.square().sum(-1, keepdim=True) + 1e-6).sqrt() * q.shape[-1] ** -0.5

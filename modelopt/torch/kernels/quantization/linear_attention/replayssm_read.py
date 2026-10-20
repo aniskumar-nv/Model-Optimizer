@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NVFP4 read refresh using upstream ReplaySSM's codec, independent of anchor precision.
+"""Per-request, per-head NVFP4 read refresh using upstream ReplaySSM's codec.
 
-Imported only for stochastic reads. Request seeds and logical element offsets
-keep the random stream independent of cache slot placement and CUDA graph replay.
+Request seeds and logical element offsets keep the random stream independent
+of cache slot placement and CUDA graph replay.
 """
 
 import triton
@@ -39,11 +39,11 @@ def _refresh_read(
     STATE_STRIDE: tl.constexpr,
     AMAX_STRIDE: tl.constexpr,
     SEED_STRIDE: tl.constexpr,
-    H: tl.constexpr,
     V: tl.constexpr,
     K: tl.constexpr,
     TILE: tl.constexpr,
     TILES: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
 ):
     tile, batch, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     slot = tl.load(Indices + batch)
@@ -57,35 +57,37 @@ def _refresh_read(
     logical = (head * V + rows[:, None]) * K + columns[None, :]
     offset = slot * STATE_STRIDE + logical
     state = tl.load(Anchor + offset, rows[:, None] < V, other=0)
-    blocks = tl.arange(0, triton.next_power_of_2(H * TILES))
-    amax = tl.max(tl.load(Amax + slot * AMAX_STRIDE + blocks, blocks < H * TILES, other=0))
-    seed = tl.load(Seeds + slot * SEED_STRIDE)
-    # Initial read is refresh 0; the first completed window is refresh 1.
-    refresh = window + (pos == 15).to(tl.int32)
-    uniform = tl.rand(seed + refresh * 1103515245, logical)
-    rounded = quantize_nvfp4(state, uniform, nvfp4_outer_scale(amax), True, K // 16, 16)
+    blocks = tl.arange(0, TILES)
+    amax = tl.max(tl.load(Amax + slot * AMAX_STRIDE + head * TILES + blocks))
+    uniform = 0.0
+    if STOCHASTIC:
+        seed = tl.load(Seeds + slot * SEED_STRIDE)
+        # Initial read is refresh 0; the first completed window is refresh 1.
+        refresh = window + (pos == 15).to(tl.int32)
+        uniform = tl.rand(seed + refresh * 1103515245, logical)
+    rounded = quantize_nvfp4(state, uniform, nvfp4_outer_scale(amax), STOCHASTIC, K // 16, 16)
     tl.store(Read + offset, rounded, rows[:, None] < V)
 
 
-def refresh_nvfp4_read(anchor, read, amax, seeds, positions, windows, indices, *, null=-1):
-    """Refresh only the read copy at seed/flush; the FP32 anchor is never rounded."""
+def refresh_nvfp4_read(anchor, read, amax, positions, windows, indices, *, seeds=None, null=-1):
+    """Refresh reads at seed/flush with per-head scales; seeds enable stochastic rounding."""
     _, heads, values, keys = anchor.shape
     tiles = triton.next_power_of_2(triton.cdiv(values, 64))
     _refresh_read[(triton.cdiv(values, 64), len(indices), heads)](
         anchor,
         read,
         amax,
-        seeds,
+        anchor if seeds is None else seeds,
         positions,
         windows,
         indices,
         null,
         anchor.stride(0),
         amax.stride(0),
-        seeds.stride(0),
-        heads,
+        0 if seeds is None else seeds.stride(0),
         values,
         keys,
         64,
         tiles,
+        seeds is not None,
     )
