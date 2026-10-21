@@ -15,7 +15,7 @@
 
 """Differentiable adapter for the installed serving runtime's arithmetic.
 
-Native kernels supply forward values. Prefill prepares only the intermediates for FLA backward;
+Native kernels supply forward values. GDN retains native chunk factors for FLA backward;
 decode uses an explicit recurrence adjoint. QDQ uses identity STE.
 The optional vLLM dependency supplies kernels; training owns its state and needs no server.
 """
@@ -25,15 +25,31 @@ from torch.autograd.function import once_differentiable
 
 
 class _Prefill(torch.autograd.Function):
-    """Run native prefill once and reconstruct FLA's backward inputs on demand."""
+    """Run native prefill once and reuse GDN's prepared operands and chunk factor in backward."""
 
     @staticmethod
-    def forward(ctx, q, k, v, g, beta, state, scale, beta_dtype, normalize, gate_inputs, precision):
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        scale,
+        beta_dtype,
+        normalize,
+        raw_g,
+        raw_beta,
+        rate,
+        bias,
+        precision,
+    ):
         # Keep optional inference kernels isolated to the serving profile.
         from ...kernels.quantization.linear_attention.serving.forward import prefill
 
         q, k, v = (x.to(torch.bfloat16) for x in (q, k, v))
-        out, final = prefill(
+        out, final, intermediates = prefill(
             q,
             k,
             v,
@@ -42,10 +58,31 @@ class _Prefill(torch.autograd.Function):
             state.float(),
             scale,
             normalize,
-            gate_inputs,
+            None if raw_g is None else (raw_g, raw_beta, rate, bias),
             precision=precision,
+            return_intermediates=True,
         )
-        ctx.save_for_backward(q, k, v, g, beta, state)
+        ctx.native_gdn = intermediates is not None
+        if ctx.native_gdn:
+            prepared_q, prepared_k, g, beta, cumulative, factor = intermediates
+            ctx.save_for_backward(
+                q,
+                k,
+                v,
+                g[0],
+                beta[0],
+                state,
+                prepared_q,
+                prepared_k,
+                cumulative,
+                factor,
+                raw_g,
+                raw_beta,
+                rate,
+                bias,
+            )
+        else:
+            ctx.save_for_backward(q, k, v, g, beta, state)
         ctx.scale, ctx.normalize = scale, normalize
         ctx.set_materialize_grads(False)
         return out.float(), final
@@ -58,11 +95,16 @@ class _Prefill(torch.autograd.Function):
         from fla.ops.utils import chunk_local_cumsum
         from fla.ops.utils.constant import RCP_LN2
 
-        q, k, v, g, beta, state = (x[None].contiguous() for x in ctx.saved_tensors)
+        q, k, v, g, beta, state = (x[None].contiguous() for x in ctx.saved_tensors[:6])
         if ctx.normalize:
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
-        cumulative = chunk_local_cumsum(g, chunk_size=64, scale=RCP_LN2)
+        if ctx.native_gdn:
+            q, k, cumulative, a, raw_g, raw_beta, rate, bias = ctx.saved_tensors[6:]
+            # vLLM stores natural-log cumulative gates; FLA evaluates them with exp2.
+            cumulative = cumulative * RCP_LN2
+        else:
+            cumulative = chunk_local_cumsum(g, chunk_size=64, scale=RCP_LN2)
         kwargs = {
             "q": q,
             "k": k,
@@ -76,8 +118,8 @@ class _Prefill(torch.autograd.Function):
             else grad_output[None].to(v).contiguous(),
             "dht": None if grad_final is None else grad_final[None].contiguous(),
         }
-        # Rebuild only intra-chunk factors. The upstream backward already reconstructs
-        # chunk states; a second full prefill would also compute unused outputs/states.
+        # Rebuild factors only when the native forward did not retain them.
+        # Upstream backward reconstructs chunk states without a second full prefill.
         if g.ndim == 4:
             from fla.ops.kda.chunk_bwd import chunk_kda_bwd
             from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra
@@ -88,16 +130,36 @@ class _Prefill(torch.autograd.Function):
             from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd
             from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra
 
-            a = chunk_gated_delta_rule_fwd_intra(k, v, cumulative, beta)[-1]
+            if not ctx.native_gdn:
+                a = chunk_gated_delta_rule_fwd_intra(k, v, cumulative, beta)[-1]
             dq, dk, dv, db, dg, dh, *_ = chunk_gated_delta_rule_bwd(**kwargs, A=a)
         if ctx.normalize:
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)
+        raw_grads = (None,) * 4
+        if ctx.native_gdn:
+            from fla.ops.common.gate import fused_beta_sigmoid_bwd
+            from fla.ops.gated_delta_rule.gate import gdn_gate_bwd
+
+            # Differentiate the raw BF16 projections consumed by native preparation.
+            # The caller's independently prepared g/beta did not participate in this forward.
+            d_raw_g, d_rate, d_bias = gdn_gate_bwd(
+                raw_g.bfloat16().float().contiguous(),
+                rate.contiguous(),
+                bias.contiguous(),
+                dg[0].contiguous(),
+            )
+            d_raw_beta = fused_beta_sigmoid_bwd(
+                raw_beta.bfloat16().float().contiguous(), db[0].contiguous()
+            )
+            raw_grads = (d_raw_g, d_raw_beta, d_rate, d_bias)
         # Match FLA's BF16 operand-gradient rounding before upstream FP32 casts.
         grads = tuple(
             dx[0].to(x.dtype) for dx, x in zip((dq, dk, dv, dg, db, dh), (q, k, v, g, beta, state))
         )
-        return (*grads, None, None, None, None, None)
+        if ctx.native_gdn:
+            grads = (*grads[:3], None, None, grads[5])
+        return (*grads, None, None, None, *raw_grads, None)
 
 
 def prefix(
@@ -105,7 +167,17 @@ def prefix(
 ):
     """Return native prefix output/state with an upstream FLA recurrence backward."""
     return _Prefill.apply(
-        q, k, v, g, beta, state, scale, beta_dtype, normalize, gate_inputs, precision
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        scale,
+        beta_dtype,
+        normalize,
+        *((None,) * 4 if gate_inputs is None else gate_inputs),
+        precision,
     )
 
 
