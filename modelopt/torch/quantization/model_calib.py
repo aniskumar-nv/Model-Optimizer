@@ -2518,8 +2518,11 @@ def gptq(
             for weight_name, weight, quantizers, input_quantizer in _fused_expert_projections(
                 module
             ):
+                # This rank's experts, in quantizer order: an expert-parallel weight is a DTensor
+                # whose index names a global expert and all-gathers every expert.
+                local = module._local_experts(weight)
                 per_expert = {
-                    idx: _make_gptq_handle(f"{name}.{weight_name}.{idx}", module, q, weight[idx])
+                    idx: _make_gptq_handle(f"{name}.{weight_name}.{idx}", module, q, local[idx])
                     for idx, q in enumerate(quantizers)
                     if q.is_enabled
                 }
