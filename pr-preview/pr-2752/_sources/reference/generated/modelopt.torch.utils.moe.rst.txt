@@ -39,6 +39,7 @@ moe
    
       a2a_moe
       apply_distributed_support
+      check_distributed_support
       choose_ep_dp_degrees
       expert_parallel_mesh
       num_experts_from_config
