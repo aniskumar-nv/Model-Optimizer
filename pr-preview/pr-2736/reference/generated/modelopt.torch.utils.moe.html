@@ -2,7 +2,7 @@
 <html lang="en" data-accent-color="green" data-content_root="../../">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"><title>moe - Model Optimizer 0.0.1.dev1+g58fbbb62b</title><link rel="index" title="Index" href="../../genindex.html" /><link rel="search" title="Search" href="../../search.html" /><link rel="next" title="nemotron_vlm_dataset_utils" href="modelopt.torch.utils.nemotron_vlm_dataset_utils.html" /><link rel="prev" title="mlflow" href="modelopt.torch.utils.mlflow.html" /><script>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"><title>moe - Model Optimizer 0.0.1.dev1+ge14e86973</title><link rel="index" title="Index" href="../../genindex.html" /><link rel="search" title="Search" href="../../search.html" /><link rel="next" title="nemotron_vlm_dataset_utils" href="modelopt.torch.utils.nemotron_vlm_dataset_utils.html" /><link rel="prev" title="mlflow" href="modelopt.torch.utils.mlflow.html" /><script>
     function setColorMode(t){let e=document.documentElement;e.setAttribute("data-color-mode",t);let a=window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches,s=t;"auto"===t&&(s=a?"dark":"light"),"light"===s?(e.classList.remove("dark"),e.classList.add("light")):(e.classList.remove("light"),e.classList.add("dark"))}
     setColorMode(localStorage._theme||"auto");
   </script><link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=e1a1ceaf" />
@@ -453,7 +453,7 @@ transformers-<code class="docutils literal notranslate"><span class="pre">Expert
 <table class="autosummary longtable docutils align-default">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.utils.moe.a2a_moe" title="modelopt.torch.utils.moe.a2a_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">a2a_moe</span></code></a></p></td>
-<td><p>Route one MoE layer's expert stage by all-to-all (NCCL).</p></td>
+<td><p>Route one MoE layer's expert stage by plain <cite>torch.distributed.all_to_all_single</cite> (NCCL).</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.utils.moe.register_torch_a2a" title="modelopt.torch.utils.moe.register_torch_a2a"><code class="xref py py-obj docutils literal notranslate"><span class="pre">register_torch_a2a</span></code></a></p></td>
 <td><p>Register everything the torch_a2a path needs into stock transformers (idempotent).</p></td>
@@ -466,8 +466,14 @@ transformers-<code class="docutils literal notranslate"><span class="pre">Expert
 </div>
 <dl class="py function">
 <dt class="sig sig-object py" id="modelopt.torch.utils.moe.a2a_moe">
-<span class="sig-name descname"><span class="pre">a2a_moe</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">topk_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">topk_weights</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_global_experts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_local_experts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">expert_fn</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.utils.moe.a2a_moe" title="Link to this definition">#</a></dt>
-<dd><p>Route one MoE layer’s expert stage by all-to-all (NCCL).</p>
+<span class="sig-name descname"><span class="pre">a2a_moe</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">topk_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">topk_weights</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_local_experts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">expert_fn</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.utils.moe.a2a_moe" title="Link to this definition">#</a></dt>
+<dd><p>Route one MoE layer’s expert stage by plain <cite>torch.distributed.all_to_all_single</cite> (NCCL).</p>
+<p>Works cross-node at any rank count, with explicit token permute/unpermute.</p>
+<p>Flow: expand (token, expert) pairs -&gt; route each to dest_rank = global_expert // num_local -&gt;
+all_to_all the tokens (+ local-expert id + weight) -&gt; local grouped_mm (quantizable) -&gt; weight -&gt;
+all_to_all back -&gt; scatter-sum to original tokens.</p>
+<p>Tokens travel and the result returns in <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code>’ dtype – the model’s, so its residual
+stream keeps one dtype – and only the per-token combine accumulates in fp32.</p>
 </dd></dl>
 
 <dl class="py function">
