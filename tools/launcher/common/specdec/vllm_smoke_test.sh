@@ -31,8 +31,8 @@
 #   MIN_ACCEPTANCE_LENGTH — fail unless the mean acceptance length (from vLLM's /metrics
 #                    counters) reaches this; also fails if no speculative drafts were recorded
 #   SMOKE_JSON      — also write the result to this file as JSON, on every exit; "stage"
-#                    records how far the run got (starting, draft_missing, server_died,
-#                    server_timeout, serving, completed)
+#                    records how far the run got (invalid_config, starting, draft_missing,
+#                    server_died, server_timeout, serving, completed)
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
@@ -46,8 +46,8 @@ NUM_SPEC=${NUM_SPEC_TOKENS:-15}
 STAGE=starting
 VERDICT=FAIL
 REASON=""
-PASS=0
-FAIL=0
+PROMPTS_OK=0
+PROMPTS_FAILED=0
 TOTAL_TOKENS=0
 AVG_TPS="?"
 AVG_ACCEPT=""
@@ -55,8 +55,9 @@ AVG_ACCEPT=""
 write_smoke_json() {
     [ -n "${SMOKE_JSON:-}" ] || return 0
     python3 - "$SMOKE_JSON" "$STAGE" "$VERDICT" "$REASON" "$METHOD" "$MODEL" "${DRAFT:-}" "$NUM_SPEC" \
-        "$PASS" "$FAIL" "$TOTAL_TOKENS" "$AVG_TPS" "${AVG_ACCEPT:-}" "${MIN_ACCEPTANCE_LENGTH:-}" <<'EOF'
+        "$PROMPTS_OK" "$PROMPTS_FAILED" "$TOTAL_TOKENS" "$AVG_TPS" "${AVG_ACCEPT:-}" "${MIN_ACCEPTANCE_LENGTH:-}" <<'EOF'
 import json
+import math
 import os
 import sys
 
@@ -66,9 +67,14 @@ import sys
 
 def num(value):
     try:
-        return float(value)
+        value = float(value)
     except ValueError:
         return None
+    return value if math.isfinite(value) else None
+
+
+def count(value):
+    return int(value) if value.isdigit() else None
 
 
 result = {
@@ -78,7 +84,7 @@ result = {
     "method": method,
     "target": target,
     "draft": draft or None,
-    "num_speculative_tokens": int(num_spec),
+    "num_speculative_tokens": count(num_spec),
     "prompts_passed": int(n_pass),
     "prompts_failed": int(n_fail),
     "total_tokens": int(tokens),
@@ -95,11 +101,26 @@ EOF
 
 # A result left by an earlier run must never be read as this run's.
 [ -n "${SMOKE_JSON:-}" ] && rm -f "$SMOKE_JSON"
-cleanup() { write_smoke_json; kill $SERVER_PID 2>/dev/null; sleep 2; kill -9 $SERVER_PID 2>/dev/null; rm -f "${VLLM_LOG:-}" 2>/dev/null; }
+cleanup() {
+    write_smoke_json
+    if [ -n "${SERVER_PID:-}" ]; then kill $SERVER_PID 2>/dev/null; sleep 2; kill -9 $SERVER_PID 2>/dev/null; fi
+    rm -f "${VLLM_LOG:-}" 2>/dev/null
+}
 trap cleanup EXIT
 
-# After the trap, so a failure here still writes this run's SMOKE_JSON.
-source "${SCRIPT_DIR}/../service_utils.sh" || { REASON="cannot source service_utils.sh"; echo "ERROR: $REASON"; exit 1; }
+# Checked after the trap, so a bad value still writes this run's SMOKE_JSON.
+if [ -n "${MIN_ACCEPTANCE_LENGTH:-}" ] && ! python3 -c 'import math, sys; sys.exit(not math.isfinite(float(sys.argv[1])))' "$MIN_ACCEPTANCE_LENGTH" 2>/dev/null; then
+    REASON="MIN_ACCEPTANCE_LENGTH='${MIN_ACCEPTANCE_LENGTH}' is not a finite number"
+elif ! [[ "$NUM_SPEC" =~ ^[0-9]+$ ]] || [ "$NUM_SPEC" -eq 0 ]; then
+    REASON="NUM_SPEC_TOKENS='${NUM_SPEC}' is not a positive integer"
+fi
+if [ -n "$REASON" ]; then
+    STAGE=invalid_config; echo "ERROR: $REASON"; exit 1
+fi
+
+# source returns the status of service_utils.sh's last command, an unrelated rank-0 append.
+[ -f "${SCRIPT_DIR}/../service_utils.sh" ] || { REASON="cannot find service_utils.sh"; echo "ERROR: $REASON"; exit 1; }
+source "${SCRIPT_DIR}/../service_utils.sh"
 
 # Auto-detect exported checkpoint from training output dir
 if [ -z "$DRAFT" ] && [ -n "${DRAFT_CKPT_DIR:-}" ]; then
@@ -214,18 +235,18 @@ for PROMPT in \
     if [ -n "$TOKENS" ] && [ "$TOKENS" -gt 0 ] 2>/dev/null; then
         TPS=$(ratio "${TOKENS}e9" "$ELAPSED_NS" 1)
         echo "  PASS: ${TOKENS} tokens in ${ELAPSED}s (${TPS} tok/s) — \"${PROMPT:0:50}...\""
-        PASS=$((PASS + 1))
+        PROMPTS_OK=$((PROMPTS_OK + 1))
         TOTAL_TOKENS=$((TOTAL_TOKENS + TOKENS))
         TOTAL_NS=$((TOTAL_NS + ELAPSED_NS))
     else
         echo "  FAIL: \"${PROMPT}\""
         echo "  Response: $(echo "$RESULT" | head -c 200)"
-        FAIL=$((FAIL + 1))
+        PROMPTS_FAILED=$((PROMPTS_FAILED + 1))
     fi
 done
 
 echo ""
-echo "Results: ${PASS} passed, ${FAIL} failed"
+echo "Results: ${PROMPTS_OK} passed, ${PROMPTS_FAILED} failed"
 if [ "$TOTAL_TOKENS" -gt 0 ] 2>/dev/null; then
     AVG_TPS=$(ratio "${TOTAL_TOKENS}e9" "$TOTAL_NS" 1)
     echo "Total: ${TOTAL_TOKENS} tokens in $(ratio "$TOTAL_NS" 1e9 2)s (${AVG_TPS} tok/s avg)"
@@ -261,9 +282,9 @@ if drafts > 0:
 STAGE=completed
 VERDICT=PASS
 REASON=""
-if [ $FAIL -gt 0 ]; then
+if [ $PROMPTS_FAILED -gt 0 ]; then
     VERDICT=FAIL
-    REASON="ERROR: Some prompts failed"
+    REASON="${PROMPTS_FAILED} of $((PROMPTS_OK + PROMPTS_FAILED)) prompts failed"
 elif [ -n "${MIN_ACCEPTANCE_LENGTH:-}" ]; then
     echo ""
     echo "=== Acceptance Length Regression Check ==="
